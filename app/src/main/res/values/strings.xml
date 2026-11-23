@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ReelTracker</string>
+    <string name="accessibility_service_description">ReelTracker counts how many Instagram Reels and YouTube Shorts you watch. It reads only view layout identifiers and scroll position numbers — never video titles, captions, messages, or account information. All data stays on your device.</string>
+    <string name="notification_channel_name">ReelTracker Active</string>
+    <string name="notification_channel_desc">Shown while ReelTracker is monitoring short-form video feeds.</string>
+    <string name="notification_title">ReelTracker is active</string>
+    <string name="notification_body">Counting Reels and Shorts in the background.</string>
+    <string name="notification_stop">Stop</string>
+</resources>

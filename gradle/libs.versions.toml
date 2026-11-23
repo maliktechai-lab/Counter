@@ -1,0 +1,70 @@
+[versions]
+agp                 = "8.7.0"
+kotlin              = "2.0.21"
+ksp                 = "2.0.21-1.0.28"
+composeBom          = "2024.11.00"
+activityCompose     = "1.9.3"
+navigationCompose   = "2.8.4"
+lifecycle           = "2.8.7"
+room                = "2.6.1"
+coroutines          = "1.9.0"
+coreKtx             = "1.15.0"
+junit5              = "5.10.1"
+junit4              = "4.13.2"
+mockk               = "1.13.12"
+androidxTestExt     = "1.2.1"
+androidxTestRunner  = "1.6.2"
+
+[libraries]
+# Core
+core-ktx                    = { group = "androidx.core",         name = "core-ktx",                   version.ref = "coreKtx" }
+
+# Compose (versions managed by BOM)
+compose-bom                 = { group = "androidx.compose",      name = "compose-bom",                version.ref = "composeBom" }
+compose-ui                  = { group = "androidx.compose.ui",   name = "ui" }
+compose-ui-graphics         = { group = "androidx.compose.ui",   name = "ui-graphics" }
+compose-ui-tooling-preview  = { group = "androidx.compose.ui",   name = "ui-tooling-preview" }
+compose-ui-tooling          = { group = "androidx.compose.ui",   name = "ui-tooling" }
+compose-material3           = { group = "androidx.compose.material3", name = "material3" }
+compose-ui-test-manifest    = { group = "androidx.compose.ui",   name = "ui-test-manifest" }
+compose-ui-test-junit4      = { group = "androidx.compose.ui",   name = "ui-test-junit4" }
+
+# Activity + Navigation
+activity-compose            = { group = "androidx.activity",     name = "activity-compose",           version.ref = "activityCompose" }
+navigation-compose          = { group = "androidx.navigation",   name = "navigation-compose",         version.ref = "navigationCompose" }
+
+# Lifecycle / ViewModel
+lifecycle-viewmodel-ktx     = { group = "androidx.lifecycle",    name = "lifecycle-viewmodel-ktx",    version.ref = "lifecycle" }
+lifecycle-runtime-ktx       = { group = "androidx.lifecycle",    name = "lifecycle-runtime-ktx",      version.ref = "lifecycle" }
+lifecycle-runtime-compose   = { group = "androidx.lifecycle",    name = "lifecycle-runtime-compose",  version.ref = "lifecycle" }
+
+# Room
+room-runtime                = { group = "androidx.room",         name = "room-runtime",               version.ref = "room" }
+room-ktx                    = { group = "androidx.room",         name = "room-ktx",                   version.ref = "room" }
+room-compiler               = { group = "androidx.room",         name = "room-compiler",              version.ref = "room" }
+room-testing                = { group = "androidx.room",         name = "room-testing",               version.ref = "room" }
+
+# Coroutines
+coroutines-android          = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+coroutines-test             = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test",    version.ref = "coroutines" }
+
+# Testing – JUnit 5 (JVM unit tests)
+junit5-api                  = { group = "org.junit.jupiter",     name = "junit-jupiter-api",          version.ref = "junit5" }
+junit5-engine               = { group = "org.junit.jupiter",     name = "junit-jupiter-engine",       version.ref = "junit5" }
+junit5-params               = { group = "org.junit.jupiter",     name = "junit-jupiter-params",       version.ref = "junit5" }
+
+# Testing – JUnit 4 (instrumented tests)
+junit4                      = { group = "junit",                 name = "junit",                      version.ref = "junit4" }
+
+# MockK (JVM unit tests)
+mockk                       = { group = "io.mockk",              name = "mockk",                      version.ref = "mockk" }
+
+# AndroidX Test (instrumented)
+androidx-test-ext           = { group = "androidx.test.ext",     name = "junit",                      version.ref = "androidxTestExt" }
+androidx-test-runner        = { group = "androidx.test",         name = "runner",                     version.ref = "androidxTestRunner" }
+
+[plugins]
+android-application         = { id = "com.android.application",              version.ref = "agp" }
+kotlin-android              = { id = "org.jetbrains.kotlin.android",         version.ref = "kotlin" }
+kotlin-compose              = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
+ksp                         = { id = "com.google.devtools.ksp",              version.ref = "ksp" }
