@@ -1,17 +1,22 @@
 package com.reeltracker.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.os.Build
 import android.view.accessibility.AccessibilityEvent
 import com.reeltracker.accessibility.detectors.DetectionResult
 import com.reeltracker.accessibility.detectors.InstagramReelsDetector
 import com.reeltracker.accessibility.detectors.YouTubeShortsDetector
 import com.reeltracker.accessibility.statemachine.CountAction
+import com.reeltracker.accessibility.statemachine.EventSignatureDeduplicator
 import com.reeltracker.accessibility.statemachine.FeedStateMachine
+import com.reeltracker.accessibility.statemachine.PendingOutcome
 import com.reeltracker.accessibility.statemachine.StateMachineEvent
+import com.reeltracker.accessibility.statemachine.TransitionConfirmationBuffer
 import com.reeltracker.di.ServiceLocator
 import com.reeltracker.domain.model.Platform
 import com.reeltracker.domain.model.TransitionType
 import com.reeltracker.domain.model.ViewEvent
+import com.reeltracker.service.KeepAliveService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,16 +26,20 @@ import kotlinx.coroutines.launch
 /**
  * Core accessibility event loop for ReelTracker.
  *
- * Receives [AccessibilityEvent]s from Instagram and YouTube (scoped by
- * accessibility_service_config.xml). For each event it:
- * 1. Takes a node tree snapshot via [NodeSnapshotBuilder] before the callback returns.
- * 2. Runs the appropriate [com.reeltracker.accessibility.detectors.FeedDetector].
- * 3. Maps the [DetectionResult] to a [StateMachineEvent].
- * 4. Feeds the event into the per-platform [FeedStateMachine].
- * 5. Executes the resulting [CountAction]s via use-cases on a background coroutine.
+ * Pipeline per event:
+ * 1. Synchronously extract an immutable [EventSnapshot] before the callback returns
+ *    (node references are pooled and recycled by the framework).
+ * 2. [ForegroundAppTracker.update] on TYPE_WINDOW_STATE_CHANGED; fire AppLeft/AppReturned.
+ * 3. [EventSignatureDeduplicator.shouldPass] — if false, drain buffer and return.
+ * 4. Run [com.reeltracker.accessibility.detectors.FeedDetector].
+ * 5. Convert [DetectionResult] → [StateMachineEvent] → [FeedStateMachine.process].
+ * 6. [TransitionConfirmationBuffer.tryCorroborate] *before* submit.
+ * 7. [TransitionConfirmationBuffer.submit] for each [CountAction].
+ * 8. [TransitionConfirmationBuffer.drain].
+ * 9. For each [PendingOutcome.Confirmed]: persist via [com.reeltracker.domain.usecase.RecordViewEventUseCase].
  *
- * Not thread-safe. All state mutations happen on the accessibility service thread;
- * IO is dispatched via the coroutine scope.
+ * Not thread-safe. All state mutations happen on the accessibility service main thread;
+ * IO is dispatched via [serviceScope].
  */
 class ReelTrackerAccessibilityService : AccessibilityService() {
 
@@ -46,36 +55,49 @@ class ReelTrackerAccessibilityService : AccessibilityService() {
         Platform.YOUTUBE   to FeedStateMachine(Platform.YOUTUBE),
     )
 
+    // ── Layer 1: deduplicator ──────────────────────────────────────────────────
+
+    private val deduplicator = EventSignatureDeduplicator()
+
+    // ── Layer 2: per-platform confirmation buffers ─────────────────────────────
+
+    private val confirmBuffers: Map<Platform, TransitionConfirmationBuffer> = mapOf(
+        Platform.INSTAGRAM to TransitionConfirmationBuffer(),
+        Platform.YOUTUBE   to TransitionConfirmationBuffer(),
+    )
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private val foregroundTracker = ForegroundAppTracker()
+    private val foregroundTracker  = ForegroundAppTracker()
     private val scrollDeltaTracker = ScrollDeltaTracker()
 
-    /**
-     * Package name that was in the foreground just before the most recent change.
-     * Used to determine which platform got an AppLeft event.
-     */
-    private var previousForegroundPkg: String? = null
+    // ── Coroutine scope ───────────────────────────────────────────────────────
 
-    // ── Coroutine scope (IO off the service main thread) ──────────────────────
-
-    private val serviceJob = SupervisorJob()
+    private val serviceJob   = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     // ── AccessibilityService lifecycle ────────────────────────────────────────
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        stateMachines.values.forEach { sm ->
-            sm.process(StateMachineEvent.ServiceResumed, System.currentTimeMillis())
-        }
+        val nowMs = System.currentTimeMillis()
+        stateMachines.values.forEach { it.process(StateMachineEvent.ServiceResumed, nowMs) }
+        deduplicator.reset()
+        scrollDeltaTracker.reset()
+        foregroundTracker.reset()
+        confirmBuffers.values.forEach { it.reset() }
+        KeepAliveService.start(this)
     }
 
+    /**
+     * onInterrupt fires when the system temporarily suspends events (e.g. phone call,
+     * screen off on some devices). It is INDEPENDENT of app-switch (AppLeft/AppReturned).
+     */
     override fun onInterrupt() {
         val nowMs = System.currentTimeMillis()
-        stateMachines.values.forEach { sm ->
-            sm.process(StateMachineEvent.ServiceInterrupted, nowMs)
-        }
+        stateMachines.values.forEach { it.process(StateMachineEvent.ServiceInterrupted, nowMs) }
+        // Cancel all pending candidates — we may miss corroborating events.
+        confirmBuffers.values.forEach { it.cancel() }
     }
 
     override fun onDestroy() {
@@ -83,60 +105,93 @@ class ReelTrackerAccessibilityService : AccessibilityService() {
         foregroundTracker.reset()
         scrollDeltaTracker.reset()
         serviceScope.cancel()
+        KeepAliveService.stop(this)
     }
 
     // ── Event processing ──────────────────────────────────────────────────────
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
-        val pkg = event.packageName?.toString() ?: return
 
-        // Only process events from supported platforms
-        val platform = try {
-            Platform.fromPackage(pkg)
-        } catch (_: IllegalArgumentException) {
-            return
+        // ── Synchronous framework-object reads (must finish before callback returns) ──
+        val pkg       = event.packageName?.toString() ?: return
+        val eType     = event.eventType
+        val sourceRes = event.source?.viewIdResourceName   // read from pooled object now
+        val sY        = event.scrollY                      // available API 26+
+        val action    = event.action
+        val ts        = event.eventTime.takeIf { it > 0L } ?: System.currentTimeMillis()
+
+        // API 28+ provides scrollDeltaY directly; use sentinel below API 28
+        val rawDelta: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            event.scrollDeltaY
+        } else {
+            EventSnapshot.SCROLL_DELTA_UNAVAILABLE
         }
 
-        val nowMs = event.eventTime.takeIf { it > 0L } ?: System.currentTimeMillis()
+        val root       = rootInActiveWindow?.let { RealNodeWrapper(it) }
+        val nodeSnap   = NodeSnapshotBuilder.build(root, pkg)
 
-        // Track foreground package changes — emit AppLeft / AppReturned to relevant machine
-        val oldPkg = foregroundTracker.currentPackage()
-        val packageChanged = foregroundTracker.update(pkg, nowMs)
-        if (packageChanged) {
-            handleForegroundChange(oldPkg = oldPkg, newPkg = pkg, nowMs = nowMs)
-            previousForegroundPkg = oldPkg
+        // ── All framework object reads complete ───────────────────────────────
+
+        val sourceViewId = sourceRes?.substringAfterLast(":id/")
+
+        // For API 26/27 compute delta from ScrollDeltaTracker using scrollY;
+        // on API 28+ use the directly available value.
+        val scrollDelta = if (sY >= 0 && rawDelta == EventSnapshot.SCROLL_DELTA_UNAVAILABLE) {
+            scrollDeltaTracker.delta(sourceViewId, sY)
+        } else {
+            rawDelta
         }
-
-        // Snapshot the node tree inside the callback (nodes are recycled after return)
-        val root = rootInActiveWindow?.let { RealNodeWrapper(it) }
-        val nodeSnapshot = NodeSnapshotBuilder.build(root, pkg)
-
-        // Extract the source view ID short name from the event's source node
-        val sourceViewIdShort = event.source?.viewIdResourceName?.substringAfterLast(":id/")
-
-        // Compute scroll delta (API 26–27 compat via ScrollDeltaTracker)
-        val scrollDelta = scrollDeltaTracker.delta(sourceViewIdShort, event.scrollY)
 
         val snapshot = EventSnapshot(
             packageName  = pkg,
-            eventType    = event.eventType,
-            sourceViewId = sourceViewIdShort,
-            scrollY      = event.scrollY,
-            scrollMaxY   = -1, // AccessibilityEvent does not expose scrollMaxY via standard API
+            eventType    = eType,
+            sourceViewId = sourceViewId,
+            scrollY      = sY,
+            scrollMaxY   = -1,
             scrollDeltaY = scrollDelta,
-            eventAction  = event.action,
-            timestampMs  = nowMs,
-            nodeSnapshot = nodeSnapshot,
+            eventAction  = action,
+            timestampMs  = ts,
+            nodeSnapshot = nodeSnap,
         )
 
-        // Run detector
+        processSnapshot(snapshot)
+    }
+
+    // ── Post-snapshot pipeline ────────────────────────────────────────────────
+
+    private fun processSnapshot(snapshot: EventSnapshot) {
+        val pkg = snapshot.packageName
+
+        // Step 2: foreground tracking on window state changes
+        if (snapshot.eventType == TYPE_WINDOW_STATE_CHANGED) {
+            val oldPkg = foregroundTracker.currentPackage()
+            val changed = foregroundTracker.update(pkg, snapshot.timestampMs)
+            if (changed) {
+                handleForegroundChange(oldPkg, pkg, snapshot.timestampMs)
+                scrollDeltaTracker.reset()
+                deduplicator.reset()
+            }
+        }
+
+        // Gate: only process events from supported platforms
+        val platform = platformForPkg(pkg) ?: return
+        val machine  = stateMachines[platform]  ?: return
+        val buffer   = confirmBuffers[platform] ?: return
+
+        // Step 3: Layer 1 deduplication
+        if (!deduplicator.shouldPass(platform, snapshot)) {
+            buffer.drain(snapshot.timestampMs)
+            return
+        }
+
+        // Step 4: detection
         val result = when (platform) {
             Platform.INSTAGRAM -> igDetector.detect(snapshot)
             Platform.YOUTUBE   -> ytDetector.detect(snapshot)
         }
 
-        // Map detection result → state machine event
+        // Step 5: state machine
         val smEvent: StateMachineEvent = when (result) {
             is DetectionResult.InFeed -> {
                 if (result.isTransition) StateMachineEvent.FeedScrolled(result.confidence)
@@ -146,26 +201,48 @@ class ReelTrackerAccessibilityService : AccessibilityService() {
             is DetectionResult.Unknown -> StateMachineEvent.FeedLost
         }
 
-        val machine = stateMachines[platform] ?: return
-        val actions = machine.process(smEvent, nowMs)
+        val actions = machine.process(smEvent, snapshot.timestampMs)
 
-        // Execute confirmed actions on IO dispatcher
-        if (actions.isNotEmpty()) {
+        // Cancel buffer if feed was lost
+        if (smEvent == StateMachineEvent.FeedLost) {
+            buffer.cancel()
+        }
+
+        // Step 6: tryCorroborate BEFORE submit
+        val isFeedContainer = isFeedContainer(platform, snapshot.sourceViewId)
+        buffer.tryCorroborate(
+            eventType        = snapshot.eventType,
+            sourceViewId     = snapshot.sourceViewId,
+            scrollY          = snapshot.scrollY,
+            eventTimestampMs = snapshot.timestampMs,
+            isFeedContainer  = isFeedContainer,
+        )
+
+        // Steps 7+8: submit each action, then drain
+        val outcomes = mutableListOf<PendingOutcome>()
+        for (a in actions) {
+            outcomes += buffer.submit(a, snapshot.scrollY, snapshot.timestampMs)
+        }
+        outcomes += buffer.drain(snapshot.timestampMs)
+
+        // Step 9: persist confirmed events
+        val confirmed = outcomes.filterIsInstance<PendingOutcome.Confirmed>()
+        if (confirmed.isNotEmpty()) {
             val recordViewEvent = ServiceLocator.recordViewEventUseCase
             serviceScope.launch {
-                for (action in actions) {
-                    val viewEvent = when (action) {
+                for (outcome in confirmed) {
+                    val viewEvent = when (val ca = outcome.action) {
                         is CountAction.RecordEntry -> ViewEvent(
-                            platform       = action.platform,
-                            timestampMs    = action.timestampMs,
+                            platform       = ca.platform,
+                            timestampMs    = ca.timestampMs,
                             transitionType = TransitionType.ENTRY,
-                            confidence     = action.confidence,
+                            confidence     = ca.confidence,
                         )
                         is CountAction.RecordTransition -> ViewEvent(
-                            platform       = action.platform,
-                            timestampMs    = action.timestampMs,
+                            platform       = ca.platform,
+                            timestampMs    = ca.timestampMs,
                             transitionType = TransitionType.TRANSITION,
-                            confidence     = action.confidence,
+                            confidence     = ca.confidence,
                         )
                     }
                     recordViewEvent(viewEvent)
@@ -174,34 +251,37 @@ class ReelTrackerAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Foreground change helpers ──────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /**
-     * Called when the foreground package changes from [oldPkg] to [newPkg].
-     *
-     * Fires [StateMachineEvent.AppLeft] on the platform that just left the foreground
-     * and [StateMachineEvent.AppReturned] on the platform that returned, if applicable.
-     */
     private fun handleForegroundChange(oldPkg: String?, newPkg: String, nowMs: Long) {
-        // Platform that left the foreground
         if (oldPkg != null) {
-            val leavingPlatform = platformForPkg(oldPkg)
-            if (leavingPlatform != null) {
+            platformForPkg(oldPkg)?.let { leavingPlatform ->
                 stateMachines[leavingPlatform]?.process(StateMachineEvent.AppLeft, nowMs)
-                scrollDeltaTracker.reset()
+                confirmBuffers[leavingPlatform]?.cancel()
             }
         }
-
-        // Platform that returned to the foreground (if the new pkg is a target)
-        val returningPlatform = platformForPkg(newPkg)
-        if (returningPlatform != null && oldPkg != null) {
-            // Compute absence duration: time since the returning platform last left
-            // foregroundTracker now shows newPkg; duration is measured from when it changed
-            val absenceMs = foregroundTracker.foregroundDurationMs(nowMs)
-            stateMachines[returningPlatform]?.process(StateMachineEvent.AppReturned(absenceMs), nowMs)
+        if (oldPkg != null) {
+            platformForPkg(newPkg)?.let { returningPlatform ->
+                val absenceMs = foregroundTracker.foregroundDurationMs(nowMs)
+                stateMachines[returningPlatform]?.process(
+                    StateMachineEvent.AppReturned(absenceMs), nowMs
+                )
+            }
         }
     }
 
     private fun platformForPkg(pkg: String): Platform? =
         Platform.values().firstOrNull { it.packageName == pkg }
+
+    private fun isFeedContainer(platform: Platform, sourceViewId: String?): Boolean {
+        if (sourceViewId == null) return false
+        return when (platform) {
+            Platform.INSTAGRAM -> sourceViewId in igDetector.feedContainerIds
+            Platform.YOUTUBE   -> sourceViewId in ytDetector.feedContainerIds
+        }
+    }
+
+    companion object {
+        private const val TYPE_WINDOW_STATE_CHANGED = 0x00000020
+    }
 }
